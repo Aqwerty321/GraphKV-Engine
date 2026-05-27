@@ -1,0 +1,24 @@
+# Build directories
+build/
+build-core/
+build-require-folly/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+Makefile
+
+# Binaries
+*.o
+*.so
+*.a
+*.out
+
+# IDE
+.vscode/
+.idea/
+
+# Misc
+.cache/

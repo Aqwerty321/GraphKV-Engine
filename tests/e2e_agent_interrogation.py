@@ -32,6 +32,7 @@ ARCHITECTURE_QUERY = (
 WRITE_QUERY = (
     "Perform a disposable write-and-execute smoke test in tests/fixtures/agent_mutation_target.py. "
     "Use only graphkv-binary-star MCP tools. First call query_context for the target file and main_initialization. "
+    "Then call search_source for main_initialization and read_source_slice around the returned line numbers. "
     "Then use edit_source_code to add a small Python logging statement inside main_initialization without changing its return value. "
     "Finally call execute_sandbox with exactly: python3 -m py_compile tests/fixtures/agent_mutation_target.py. "
     "Finish with the marker WRITE_EXECUTE_COMPLETE."
@@ -40,6 +41,8 @@ WRITE_QUERY = (
 CUSTOM_TOOLS = {
     "query_context",
     "read_directory_lens",
+    "search_source",
+    "read_source_slice",
     "execute_sandbox",
     "edit_source_code",
     "ingest_web_documentation",
@@ -425,7 +428,7 @@ def main() -> int:
             write_turn = run_opencode_turn(root, WRITE_QUERY, args.timeout_seconds, session_id, session_id is None, title)
             if write_turn.command.returncode != 0:
                 raise AssertionError(f"write/execute turn failed with {write_turn.command.returncode}\n{write_turn.combined}")
-            for expected_tool in ("query_context", "edit_source_code", "execute_sandbox"):
+            for expected_tool in ("query_context", "search_source", "read_source_slice", "edit_source_code", "execute_sandbox"):
                 assert_contains_tool(write_turn, expected_tool)
             assert_no_native_fallback(write_turn, allow_execute_sandbox=True)
             verify_mutation(root, fixture)

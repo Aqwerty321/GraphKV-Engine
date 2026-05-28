@@ -31,6 +31,72 @@ DEFAULT_SANDBOX_IMAGE = "python:3.12-slim"
 MAX_LOG_LINES = 2000
 WEB_DOCUMENTATION_SUBJECT = "graphkv.documentation.ingest.requests"
 SANDBOX_LOG_SUBJECT = "graphkv.sandbox.logs.ingest.requests"
+SOURCE_SKIP_DIRS = {
+    ".cache",
+    ".git",
+    ".hg",
+    ".mypy_cache",
+    ".next",
+    ".pnpm-store",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".svn",
+    ".turbo",
+    ".venv",
+    "_deps",
+    "__pycache__",
+    "build",
+    "build-benchmark",
+    "build-core",
+    "build-doc-plane",
+    "build-impl",
+    "build-impl-server",
+    "build-require-folly",
+    "CMakeFiles",
+    "coverage",
+    "dist",
+    "htmlcov",
+    "node_modules",
+    "target",
+    "tmp",
+    "uploads",
+    "venv",
+}
+SOURCE_EXTENSIONS = {
+    ".c",
+    ".cc",
+    ".cpp",
+    ".cs",
+    ".css",
+    ".go",
+    ".h",
+    ".hpp",
+    ".java",
+    ".js",
+    ".jsx",
+    ".kt",
+    ".lua",
+    ".md",
+    ".mdx",
+    ".php",
+    ".proto",
+    ".py",
+    ".rb",
+    ".rs",
+    ".rst",
+    ".sh",
+    ".swift",
+    ".ts",
+    ".tsx",
+    ".txt",
+    ".vue",
+    ".yaml",
+    ".yml",
+}
+MAX_SOURCE_FILE_BYTES = 512 * 1024
+MAX_SOURCE_SLICE_LINES = 240
+MAX_SOURCE_SEARCH_FILES = 1500
+MAX_SOURCE_SEARCH_RESULTS = 80
 
 
 @dataclass(frozen=True)
@@ -419,45 +485,161 @@ def directory_tree(path: Path, root: Path, depth: int, budget: list[int]) -> dic
     if depth <= 0:
         node["truncated"] = True
         return node
-    blocked = {
-        ".cache",
-        ".git",
-        ".mypy_cache",
-        ".next",
-        ".pnpm-store",
-        ".pytest_cache",
-        ".ruff_cache",
-        ".turbo",
-        ".venv",
-        "_deps",
-        "__pycache__",
-        "build",
-        "build-benchmark",
-        "build-core",
-        "build-doc-plane",
-        "build-impl",
-        "build-impl-server",
-        "build-require-folly",
-        "CMakeFiles",
-        "coverage",
-        "dist",
-        "htmlcov",
-        "node_modules",
-        "target",
-        "tmp",
-        "uploads",
-        "venv",
-    }
     for child in sorted(path.iterdir(), key=lambda item: (not item.is_dir(), item.name.lower())):
         if budget[0] <= 0:
             node["truncated"] = True
             break
         budget[0] -= 1
-        if child.name in blocked and child.is_dir():
+        if child.name in SOURCE_SKIP_DIRS and child.is_dir():
             node["children"].append({"type": "directory", "path": child.relative_to(root).as_posix(), "truncated": True})
             continue
         node["children"].append(directory_tree(child, root, depth - 1, budget))
     return node
+
+
+def source_file_allowed(path: Path, root: Path) -> bool:
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        return False
+    if any(part in SOURCE_SKIP_DIRS for part in relative.parts):
+        return False
+    return path.suffix.lower() in SOURCE_EXTENSIONS
+
+
+def read_bounded_text(path: Path) -> str | None:
+    try:
+        if path.stat().st_size > MAX_SOURCE_FILE_BYTES:
+            return None
+        data = path.read_bytes()
+    except OSError:
+        return None
+    if b"\0" in data[:4096]:
+        return None
+    return data.decode("utf-8", errors="replace")
+
+
+def numbered_lines(lines: list[str], first_line: int) -> str:
+    return "\n".join(f"{line_number:>6}: {line}" for line_number, line in enumerate(lines, start=first_line))
+
+
+def iter_source_files(target: Path, root: Path, max_files: int) -> tuple[list[Path], bool]:
+    files: list[Path] = []
+    truncated = False
+    if target.is_file():
+        if source_file_allowed(target, root):
+            files.append(target)
+        return files, False
+    for current, dirnames, filenames in os.walk(target):
+        dirnames[:] = sorted(name for name in dirnames if name not in SOURCE_SKIP_DIRS)
+        for filename in sorted(filenames):
+            candidate = Path(current) / filename
+            if not candidate.is_file() or not source_file_allowed(candidate, root):
+                continue
+            if len(files) >= max_files:
+                truncated = True
+                break
+            files.append(candidate)
+        if truncated:
+            break
+    return files, truncated
+
+
+def source_slice_payload(root: Path, target: Path, start_line: int, end_line: int) -> dict[str, Any]:
+    if start_line < 1 or end_line < start_line:
+        raise ValueError("line range must be 1-indexed and inclusive")
+    if end_line - start_line + 1 > MAX_SOURCE_SLICE_LINES:
+        end_line = start_line + MAX_SOURCE_SLICE_LINES - 1
+    text = read_bounded_text(target)
+    if text is None:
+        raise ValueError(f"file is not a bounded UTF-8 source file: {target.relative_to(root).as_posix()}")
+    lines = text.splitlines()
+    line_count = len(lines)
+    if line_count == 0:
+        return {
+            "ok": True,
+            "path": target.relative_to(root).as_posix(),
+            "start_line": 1,
+            "end_line": 0,
+            "line_count": 0,
+            "numbered_text": "",
+            "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        }
+    if start_line > line_count:
+        raise ValueError(f"start_line {start_line} exceeds file length {line_count}")
+    actual_end = min(end_line, line_count)
+    selected = lines[start_line - 1 : actual_end]
+    return {
+        "ok": True,
+        "path": target.relative_to(root).as_posix(),
+        "start_line": start_line,
+        "end_line": actual_end,
+        "line_count": line_count,
+        "truncated": actual_end < end_line,
+        "numbered_text": numbered_lines(selected, start_line),
+        "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+    }
+
+
+def search_source_payload(
+    root: Path,
+    target: Path,
+    query: str,
+    case_sensitive: bool,
+    context_lines: int,
+    max_results: int,
+) -> dict[str, Any]:
+    query = query.strip()
+    if not query:
+        raise ValueError("query must not be empty")
+    context_lines = max(0, min(context_lines, 5))
+    max_results = max(1, min(max_results, MAX_SOURCE_SEARCH_RESULTS))
+    files, scan_truncated = iter_source_files(target, root, MAX_SOURCE_SEARCH_FILES)
+    needle = query if case_sensitive else query.lower()
+    matches: list[dict[str, Any]] = []
+    for path in files:
+        text = read_bounded_text(path)
+        if text is None:
+            continue
+        lines = text.splitlines()
+        for index, line in enumerate(lines):
+            haystack = line if case_sensitive else line.lower()
+            column = haystack.find(needle)
+            if column < 0:
+                continue
+            snippet_start = max(1, index + 1 - context_lines)
+            snippet_end = min(len(lines), index + 1 + context_lines)
+            matches.append(
+                {
+                    "path": path.relative_to(root).as_posix(),
+                    "line": index + 1,
+                    "column": column + 1,
+                    "snippet_start": snippet_start,
+                    "snippet_end": snippet_end,
+                    "numbered_text": numbered_lines(lines[snippet_start - 1 : snippet_end], snippet_start),
+                }
+            )
+            if len(matches) >= max_results:
+                return {
+                    "ok": True,
+                    "query": query,
+                    "path": target.relative_to(root).as_posix() if target != root else ".",
+                    "case_sensitive": case_sensitive,
+                    "scanned_files": len(files),
+                    "scan_truncated": scan_truncated,
+                    "result_truncated": True,
+                    "matches": matches,
+                }
+    return {
+        "ok": True,
+        "query": query,
+        "path": target.relative_to(root).as_posix() if target != root else ".",
+        "case_sensitive": case_sensitive,
+        "scanned_files": len(files),
+        "scan_truncated": scan_truncated,
+        "result_truncated": False,
+        "matches": matches,
+    }
 
 
 async def run_git(root: Path, args: list[str]) -> dict[str, Any]:
@@ -513,6 +695,42 @@ async def read_directory_lens(path: str, ctx: Context = None) -> dict[str, Any]:
     max_depth = int(os.getenv("GRAPHKV_MCP_LENS_DEPTH", "3"))
     max_entries = int(os.getenv("GRAPHKV_MCP_LENS_MAX_ENTRIES", "600"))
     return {"ok": True, "root": state.workspace_root.as_posix(), "tree": directory_tree(target, state.workspace_root, max_depth, [max_entries])}
+
+
+@mcp.tool()
+async def search_source(
+    query: str,
+    path: str = ".",
+    case_sensitive: bool = False,
+    context_lines: int = 1,
+    max_results: int = 40,
+    ctx: Context = None,
+) -> dict[str, Any]:
+    """search_source(query: str, path: str = '.', case_sensitive: bool = False, context_lines: int = 1, max_results: int = 40): Bounded literal source search with line-numbered snippets inside the workspace jail."""
+    if ctx is None:
+        raise RuntimeError("MCP request context is required")
+    state, _auth = await authorize(ctx, "workspace:read")
+    target = resolve_workspace_path(state.workspace_root, path)
+    if not target.exists():
+        raise FileNotFoundError(path)
+    return search_source_payload(state.workspace_root, target, query, case_sensitive, context_lines, max_results)
+
+
+@mcp.tool()
+async def read_source_slice(
+    path: str,
+    start_line: int = 1,
+    end_line: int = 80,
+    ctx: Context = None,
+) -> dict[str, Any]:
+    """read_source_slice(path: str, start_line: int = 1, end_line: int = 80): Returns a bounded line-numbered source slice inside the workspace jail."""
+    if ctx is None:
+        raise RuntimeError("MCP request context is required")
+    state, _auth = await authorize(ctx, "workspace:read")
+    target = resolve_workspace_path(state.workspace_root, path)
+    if not target.is_file() or not source_file_allowed(target, state.workspace_root):
+        raise FileNotFoundError(path)
+    return source_slice_payload(state.workspace_root, target, start_line, end_line)
 
 
 @mcp.tool()

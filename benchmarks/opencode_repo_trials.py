@@ -20,6 +20,8 @@ from typing import Any
 CUSTOM_TOOLS = {
     "query_context",
     "read_directory_lens",
+    "search_source",
+    "read_source_slice",
     "execute_sandbox",
     "edit_source_code",
     "ingest_web_documentation",
@@ -512,8 +514,9 @@ def main() -> int:
             work_message = (
                 "Use only graphkv-binary-star MCP tools to do a concrete disposable repo-local edit. "
                 f"Target {PROBE_FILE}. First call query_context for the file and the summarize_repository_signal function. "
-                "If line numbers are unclear, use execute_sandbox with a tiny Python one-liner to print the file with line numbers. "
-                "Then edit_source_code so summarize_repository_signal appends a deterministic sha256 prefix of the repository name, "
+                "Then call search_source for summarize_repository_signal, and call read_source_slice around the matching lines to get exact edit coordinates. "
+                "Do not use execute_sandbox to print line numbers. "
+                "Then edit_source_code so summarize_repository_signal preserves or adds a deterministic sha256 prefix and appends a deterministic len(repository_name) segment, "
                 f"run python3 -m py_compile {PROBE_FILE}, and run python3 {PROBE_FILE}. "
                 f"Finish with {work_marker}."
             )
@@ -522,8 +525,8 @@ def main() -> int:
             work = run_opencode(repo, work_message, args.timeout_seconds, title, "work", work_marker, args.stream_logs)
             probe_text = (repo / PROBE_FILE).read_text(encoding="utf-8", errors="replace")
             survey_expected_tools = {"query_context", "read_directory_lens"}.issubset(set(survey.tools))
-            work_expected_tools = {"query_context", "edit_source_code", "execute_sandbox"}.issubset(set(work.tools))
-            probe_verified = "sha256" in probe_text and "summarize_repository_signal" in probe_text
+            work_expected_tools = {"query_context", "search_source", "read_source_slice", "edit_source_code", "execute_sandbox"}.issubset(set(work.tools))
+            probe_verified = "sha256" in probe_text and "len(repository_name)" in probe_text and "summarize_repository_signal" in probe_text
             repo_report = {
                 "repo": repo.as_posix(),
                 "head": run_quiet(["git", "rev-parse", "--short", "HEAD"], repo, 30).stdout.strip(),

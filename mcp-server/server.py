@@ -422,7 +422,15 @@ def directory_tree(path: Path, root: Path, depth: int, budget: list[int]) -> dic
     blocked = {
         ".cache",
         ".git",
+        ".mypy_cache",
+        ".next",
+        ".pnpm-store",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".turbo",
+        ".venv",
         "_deps",
+        "__pycache__",
         "build",
         "build-benchmark",
         "build-core",
@@ -431,10 +439,14 @@ def directory_tree(path: Path, root: Path, depth: int, budget: list[int]) -> dic
         "build-impl-server",
         "build-require-folly",
         "CMakeFiles",
+        "coverage",
+        "dist",
+        "htmlcov",
         "node_modules",
         "target",
         "tmp",
         "uploads",
+        "venv",
     }
     for child in sorted(path.iterdir(), key=lambda item: (not item.is_dir(), item.name.lower())):
         if budget[0] <= 0:

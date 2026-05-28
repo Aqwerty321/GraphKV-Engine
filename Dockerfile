@@ -1,9 +1,17 @@
 ARG TENSORRT_LLM_VERSION=1.3.0rc16
 
+FROM rust:1.87-bookworm AS warden_builder
+
+WORKDIR /warden
+COPY doc-sidecar/warden/Cargo.toml doc-sidecar/warden/Cargo.lock ./
+COPY doc-sidecar/warden/src ./src
+RUN cargo test --locked \
+    && cargo build --release --locked --bin graphkv-warden --bin warden_profile
+
 FROM nvcr.io/nvidia/tensorrt-llm/devel:${TENSORRT_LLM_VERSION} AS builder
 
-ARG LLVM_VERSION=18
-ARG SCIP_PROTO_REF=main
+ARG LLVM_VERSION=22
+ARG SCIP_PROTO_REF=99236e35450ccd8b87fe58c38d31fd499d0ffdfa
 ARG FOLLY_TAG=v2026.05.25.00
 ARG FASTFLOAT_TAG=v8.2.5
 ENV DEBIAN_FRONTEND=noninteractive
@@ -18,6 +26,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && echo "deb [signed-by=/usr/share/keyrings/llvm-snapshot.gpg] http://apt.llvm.org/${UBUNTU_CODENAME}/ llvm-toolchain-${UBUNTU_CODENAME}-${LLVM_VERSION} main" > /etc/apt/sources.list.d/llvm-${LLVM_VERSION}.list \
     && apt-get update && apt-get install -y --no-install-recommends \
     clang-${LLVM_VERSION} \
+    llvm-${LLVM_VERSION} \
     clang-tools-${LLVM_VERSION} \
     lld-${LLVM_VERSION} \
     build-essential \
@@ -83,18 +92,21 @@ RUN cmake -S /src -B /build -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_C_COMPILER=clang-${LLVM_VERSION} \
     -DCMAKE_CXX_COMPILER=clang++-${LLVM_VERSION} \
+    -DCMAKE_AR=/usr/bin/llvm-ar-${LLVM_VERSION} \
+    -DCMAKE_RANLIB=/usr/bin/llvm-ranlib-${LLVM_VERSION} \
     -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld-${LLVM_VERSION}" \
     -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld-${LLVM_VERSION}" \
     -DCMAKE_PREFIX_PATH=/opt/folly \
     -DSCIP_PROTO_REF=${SCIP_PROTO_REF} \
-    -DGRAPHIFY_REQUIRE_FOLLY=ON \
-    -DGRAPHIFY_BUILD_TESTS=OFF \
-    -DGRAPHIFY_BUILD_TOOLS=ON \
-    -DGRAPHIFY_BUILD_SERVER=ON \
-    -DGRAPHIFY_REQUIRE_STD_PRINT=ON \
-    && cmake --build /build --target scip_ingest_server \
-    && cmake --install /build --prefix /opt/graphify \
-    && ldd /opt/graphify/bin/scip_ingest_server | tee /opt/graphify/ldd.scip_ingest_server.txt
+    -DGRAPHKV_REQUIRE_FOLLY=ON \
+    -DGRAPHKV_BUILD_TESTS=OFF \
+    -DGRAPHKV_BUILD_TOOLS=ON \
+    -DGRAPHKV_BUILD_SERVER=ON \
+    -DGRAPHKV_BUILD_BENCHMARKS=ON \
+    -DGRAPHKV_REQUIRE_STD_PRINT=ON \
+    && cmake --build /build --target scip_ingest_server ingest_latency_benchmark \
+    && cmake --install /build --prefix /opt/graphkv \
+    && ldd /opt/graphkv/bin/scip_ingest_server | tee /opt/graphkv/ldd.scip_ingest_server.txt
 
 FROM nvcr.io/nvidia/tensorrt-llm/release:${TENSORRT_LLM_VERSION} AS runtime
 
@@ -131,7 +143,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     liburing2 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /opt/graphify /opt/graphify
+COPY --from=builder /opt/graphkv /opt/graphkv
+COPY --from=warden_builder /warden/target/release/graphkv-warden /opt/graphkv/bin/graphkv-warden
+COPY --from=warden_builder /warden/target/release/warden_profile /opt/graphkv/bin/warden_profile
 
 EXPOSE 8888
-ENTRYPOINT ["/opt/graphify/bin/scip_ingest_server"]
+ENTRYPOINT ["/opt/graphkv/bin/scip_ingest_server"]

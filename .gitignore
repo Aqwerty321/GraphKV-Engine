@@ -1,5 +1,6 @@
 # Build directories
 build/
+build-*/
 build-core/
 build-require-folly/
 
@@ -15,6 +16,8 @@ Makefile
 *.so
 *.a
 *.out
+target/
+**/target/
 
 # IDE
 .vscode/
@@ -22,3 +25,7 @@ Makefile
 
 # Misc
 .cache/
+__pycache__/
+*.pyc
+benchmarks/results/
+benchmarks/data/local_repos/

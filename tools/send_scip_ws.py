@@ -5,6 +5,7 @@ import hashlib
 import os
 import socket
 import struct
+import subprocess
 
 
 def make_client_frame(payload: bytes) -> bytes:
@@ -46,15 +47,32 @@ def read_frame(sock: socket.socket) -> bytes:
     return bytes(payload)
 
 
+def zstd_compress_file(path: str) -> bytes:
+    try:
+        import zstandard as zstd
+    except ImportError:
+        zstd = None
+
+    if zstd is not None:
+        with open(path, "rb") as payload_file:
+            payload = payload_file.read()
+        return zstd.ZstdCompressor(write_content_size=True).compress(payload)
+
+    try:
+        completed = subprocess.run(["zstd", "-q", "-c", path], check=True, capture_output=True)
+    except FileNotFoundError as exc:
+        raise RuntimeError("send_scip_ws.py requires either the Python 'zstandard' package or the 'zstd' CLI") from exc
+    return completed.stdout
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Send a binary SCIP payload to the Graphify ingest WebSocket.")
+    parser = argparse.ArgumentParser(description="Zstd-compress and send a binary SCIP payload to the GraphKV-Engine ingest WebSocket.")
     parser.add_argument("path", help="path to a binary SCIP protobuf payload")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8888)
     args = parser.parse_args()
 
-    with open(args.path, "rb") as payload_file:
-        payload = payload_file.read()
+    payload = zstd_compress_file(args.path)
 
     key = base64.b64encode(os.urandom(16)).decode("ascii")
     request = (

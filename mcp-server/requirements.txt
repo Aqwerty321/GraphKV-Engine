@@ -1,0 +1,7 @@
+# Install or run with uv:
+#   uv run --with-requirements mcp-server/requirements.txt python mcp-server/server.py
+mcp
+docker
+websockets
+nats-py
+httpx

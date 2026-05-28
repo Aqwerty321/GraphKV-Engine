@@ -1,0 +1,15 @@
+.git/
+.cache/
+.vscode/
+.idea/
+
+build/
+build-*/
+**/target/
+
+benchmarks/results/
+benchmarks/data/local_repos/
+uploads/tmp/
+
+__pycache__/
+*.pyc

@@ -1,0 +1,96 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "permission": {
+    "websearch": "allow",
+    "webfetch": "allow",
+    "read": "allow",
+    "grep": "allow",
+    "glob": "allow",
+    "list": "allow",
+    "edit": "allow",
+    "bash": "allow"
+  },
+  "mcp": {
+    "playwright-local": {
+      "type": "local",
+      "enabled": true,
+      "command": [
+        "/home/Aaditya/.config/opencode/node_modules/.bin/playwright-mcp",
+        "--config",
+        "/home/Aaditya/.config/opencode/playwright-mcp.config.json"
+      ],
+      "environment": {}
+    },
+    "searxng-local": {
+      "type": "local",
+      "enabled": true,
+      "command": [
+        "uv",
+        "run",
+        "/home/Aaditya/ai-stack/searxng_mcp.py"
+      ],
+      "environment": {
+        "USE_RERANKER": "true",
+        "EMBED_URL": "http://127.0.0.1:8001/v1/embeddings",
+        "EMBED_MODEL": "qwen3-embedding-0_6b-q8_0",
+        "RERANK_URL": "http://127.0.0.1:8002/rerank",
+        "RERANK_MODEL": "qwen3-reranker-0.6b"
+      }
+    },
+    "firecrawl-local": {
+      "type": "remote",
+      "enabled": true,
+      "url": "http://127.0.0.1:3000/mcp",
+      "timeout": 10000
+    },
+    "neo4j-memory-local": {
+      "type": "remote",
+      "enabled": true,
+      "url": "http://127.0.0.1:3010/mcp",
+      "timeout": 10000
+    },
+    "react-bits-local": {
+      "type": "local",
+      "enabled": true,
+      "command": [
+        "uv",
+        "run",
+        "/home/Aaditya/react-bits-mcp/scripts/react_bits_mcp.py"
+      ],
+      "environment": {
+        "REACT_BITS_EMBED_BASE_URL": "http://127.0.0.1:8001",
+        "REACT_BITS_EMBED_MODEL": "qwen3-embedding-0_6b-q8_0",
+        "REACT_BITS_RERANK_URL": "http://127.0.0.1:8002/rerank",
+        "REACT_BITS_RERANK_MODEL": "qwen3-reranker-0.6b"
+      }
+    },
+    "frontend-design-vault": {
+      "type": "local",
+      "command": [
+        "/home/Aaditya/.mcp-skills-vault/.venv/bin/python",
+        "/home/Aaditya/.mcp-skills-vault/skill_vault_mcp.py",
+        "--transport",
+        "stdio"
+      ],
+      "enabled": true,
+      "environment": {
+        "SKILL_VAULT_ROOT": "/home/Aaditya/.mcp-skills-vault",
+        "SKILL_VAULT_EMBED_BACKEND": "shared",
+        "SKILL_VAULT_EMBED_URL": "http://127.0.0.1:8001/v1/embeddings",
+        "SKILL_VAULT_RERANK_BACKEND": "shared",
+        "SKILL_VAULT_RERANK_URL": "http://127.0.0.1:8002/rerank",
+        "SKILL_VAULT_RERANK_MODEL": "qwen3-reranker-0.6b",
+        "OLLAMA_BASE_URL": "http://172.23.112.1:11434"
+      }
+    },
+    "time-local": {
+      "type": "local",
+      "enabled": true,
+      "command": [
+        "/home/Aaditya/.nvm/versions/node/v24.14.1/bin/node",
+        "/home/Aaditya/timeMCP/timeserver.js"
+      ],
+      "environment": {}
+    }
+  }
+}

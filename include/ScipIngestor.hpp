@@ -1,16 +1,13 @@
 #pragma once
 
 #include "GraphKV.hpp"
+#include "GraphKVConfig.hpp"
 
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <span>
 #include <string>
-
-#ifndef GRAPHIFY_MAX_INGEST_BYTES
-#define GRAPHIFY_MAX_INGEST_BYTES 536870912
-#endif
 
 namespace graphify {
 
@@ -35,7 +32,7 @@ struct IngestError final {
 };
 
 struct IngestOptions final {
-  std::size_t max_payload_bytes{GRAPHIFY_MAX_INGEST_BYTES};
+  std::size_t max_payload_bytes{graphkv_max_ingest_bytes};
   IngestMode mode{IngestMode::strict_wire_scanner};
 };
 

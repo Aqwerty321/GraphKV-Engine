@@ -140,7 +140,7 @@ def estimate_tokens_for_bytes(byte_count: int) -> int:
     return max(1, (byte_count + 3) // 4) if byte_count else 0
 
 
-def run_streaming(args: list[str], cwd: Path, timeout_seconds: int, env: dict[str, str]) -> CommandResult:
+def run_streaming(args: list[str], cwd: Path, timeout_seconds: int, env: dict[str, str], stream_logs: bool = False) -> CommandResult:
     started = time.monotonic()
     process = subprocess.Popen(
         args,
@@ -180,7 +180,8 @@ def run_streaming(args: list[str], cwd: Path, timeout_seconds: int, env: dict[st
                 selector.unregister(stream)
                 continue
             chunks[key.data].append(data)
-            print(data, end="", file=sys.stderr if key.data == "stderr" else sys.stdout, flush=True)
+            if stream_logs:
+                print(data, end="", file=sys.stderr if key.data == "stderr" else sys.stdout, flush=True)
         if process.poll() is not None:
             for key in list(selector.get_map().values()):
                 stream = key.fileobj
@@ -358,13 +359,13 @@ def restore_opencode_config(backup: Path) -> None:
         shutil.copytree(commands_backup, commands_target)
 
 
-def run_opencode(root: Path, message: str, timeout_seconds: int, title: str, label: str, marker: str) -> TurnResult:
+def run_opencode(root: Path, message: str, timeout_seconds: int, title: str, label: str, marker: str, stream_logs: bool) -> TurnResult:
     args = ["opencode", "run", "--format", "json", "--print-logs", "--agent", "build", "--dir", str(root), "--title", title, message]
     env = os.environ.copy()
     env.setdefault("NO_COLOR", "1")
     env.setdefault("OPENCODE_DISABLE_AUTO_UPDATE", "1")
     env["OPENCODE_DISABLE_PROJECT_CONFIG"] = "1"
-    command = run_streaming(args, root, timeout_seconds, env)
+    command = run_streaming(args, root, timeout_seconds, env, stream_logs)
     events = parse_json_events(command.combined)
     tools, native_tools = extract_tools(events, command.combined)
     return TurnResult(
@@ -433,7 +434,13 @@ def validate_lockdown(repo: Path, timeout_seconds: int) -> dict[str, Any]:
         probe = run_quiet(["opencode", "debug", "agent", "build", "--tool", tool, "--params", "{}"], repo, timeout_seconds, env)
         probes[tool] = (probe.stdout + probe.stderr).strip().splitlines()[-1] if (probe.stdout + probe.stderr).strip() else ""
     isolated = "graphkv-binary-star" in mcp_list.combined and "1 server(s)" in mcp_list.combined
-    return {"isolated": isolated, "mcp_list": mcp_list.combined, "native_probe_last_lines": probes}
+    native_probes_blocked = all("disabled for agent build" in line or "not found for agent build" in line for line in probes.values())
+    return {
+        "isolated": isolated,
+        "mcp_list": mcp_list.combined,
+        "native_probe_last_lines": probes,
+        "native_probes_blocked": native_probes_blocked,
+    }
 
 
 def turn_report(turn: TurnResult) -> dict[str, Any]:
@@ -462,6 +469,7 @@ def main() -> int:
     parser.add_argument("--lens-entries", type=int, default=450)
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--no-restore-opencode", action="store_true")
+    parser.add_argument("--stream-logs", action="store_true")
     args = parser.parse_args()
 
     graphkv_root = args.graphkv_root.resolve()
@@ -510,8 +518,8 @@ def main() -> int:
                 f"Finish with {work_marker}."
             )
             title = f"GraphKV field trial {repo_name} {int(time.time())}"
-            survey = run_opencode(repo, survey_message, args.timeout_seconds, title, "survey", survey_marker)
-            work = run_opencode(repo, work_message, args.timeout_seconds, title, "work", work_marker)
+            survey = run_opencode(repo, survey_message, args.timeout_seconds, title, "survey", survey_marker, args.stream_logs)
+            work = run_opencode(repo, work_message, args.timeout_seconds, title, "work", work_marker, args.stream_logs)
             probe_text = (repo / PROBE_FILE).read_text(encoding="utf-8", errors="replace")
             survey_expected_tools = {"query_context", "read_directory_lens"}.issubset(set(survey.tools))
             work_expected_tools = {"query_context", "edit_source_code", "execute_sandbox"}.issubset(set(work.tools))
@@ -540,6 +548,7 @@ def main() -> int:
                 and work_expected_tools
                 and probe_verified
                 and lockdown["isolated"]
+                and lockdown["native_probes_blocked"]
             )
             if not repo_report["ok"]:
                 report["ok"] = False

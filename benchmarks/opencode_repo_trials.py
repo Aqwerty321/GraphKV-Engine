@@ -363,6 +363,7 @@ def run_opencode(root: Path, message: str, timeout_seconds: int, title: str, lab
     env = os.environ.copy()
     env.setdefault("NO_COLOR", "1")
     env.setdefault("OPENCODE_DISABLE_AUTO_UPDATE", "1")
+    env["OPENCODE_DISABLE_PROJECT_CONFIG"] = "1"
     command = run_streaming(args, root, timeout_seconds, env)
     events = parse_json_events(command.combined)
     tools, native_tools = extract_tools(events, command.combined)
@@ -378,9 +379,17 @@ def run_opencode(root: Path, message: str, timeout_seconds: int, title: str, lab
     )
 
 
-def run_quiet(args: list[str], cwd: Path, timeout_seconds: int) -> CommandResult:
+def opencode_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env.setdefault("NO_COLOR", "1")
+    env.setdefault("OPENCODE_DISABLE_AUTO_UPDATE", "1")
+    env["OPENCODE_DISABLE_PROJECT_CONFIG"] = "1"
+    return env
+
+
+def run_quiet(args: list[str], cwd: Path, timeout_seconds: int, env: dict[str, str] | None = None) -> CommandResult:
     started = time.monotonic()
-    completed = subprocess.run(args, cwd=cwd, text=True, capture_output=True, timeout=timeout_seconds, check=False)
+    completed = subprocess.run(args, cwd=cwd, env=env, text=True, capture_output=True, timeout=timeout_seconds, check=False)
     return CommandResult(args, completed.returncode, completed.stdout, completed.stderr, time.monotonic() - started)
 
 
@@ -417,12 +426,14 @@ def ingest_documents(graphkv_root: Path, repo: Path, output_dir: Path, port: int
 
 
 def validate_lockdown(repo: Path, timeout_seconds: int) -> dict[str, Any]:
-    mcp_list = run_quiet(["opencode", "mcp", "list"], repo, timeout_seconds)
+    env = opencode_env()
+    mcp_list = run_quiet(["opencode", "mcp", "list"], repo, timeout_seconds, env)
     probes: dict[str, str] = {}
     for tool in ("read", "bash", "grep", "glob", "webfetch", "websearch", "codesearch", "apply_patch"):
-        probe = run_quiet(["opencode", "debug", "agent", "build", "--tool", tool, "--params", "{}"], repo, timeout_seconds)
+        probe = run_quiet(["opencode", "debug", "agent", "build", "--tool", tool, "--params", "{}"], repo, timeout_seconds, env)
         probes[tool] = (probe.stdout + probe.stderr).strip().splitlines()[-1] if (probe.stdout + probe.stderr).strip() else ""
-    return {"mcp_list": mcp_list.combined, "native_probe_last_lines": probes}
+    isolated = "graphkv-binary-star" in mcp_list.combined and "1 server(s)" in mcp_list.combined
+    return {"isolated": isolated, "mcp_list": mcp_list.combined, "native_probe_last_lines": probes}
 
 
 def turn_report(turn: TurnResult) -> dict[str, Any]:
@@ -523,7 +534,13 @@ def main() -> int:
             repo_report["mcp_context_tokens_total"] = mcp_tokens
             repo_report["raw_to_mcp_context_reduction_ratio"] = round(raw_tokens / max(1, mcp_tokens), 2)
             repo_report["raw_to_mcp_context_savings_percent"] = round((1 - (mcp_tokens / max(1, raw_tokens))) * 100, 2)
-            repo_report["ok"] = all(turn["ok"] for turn in repo_report["turns"]) and survey_expected_tools and work_expected_tools and probe_verified
+            repo_report["ok"] = (
+                all(turn["ok"] for turn in repo_report["turns"])
+                and survey_expected_tools
+                and work_expected_tools
+                and probe_verified
+                and lockdown["isolated"]
+            )
             if not repo_report["ok"]:
                 report["ok"] = False
             report["repos"].append(repo_report)

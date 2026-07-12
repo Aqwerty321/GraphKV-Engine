@@ -25,6 +25,8 @@ target/
 
 # Misc
 .cache/
+.graphkv/
+graphkv-out/
 __pycache__/
 *.pyc
 benchmarks/results/

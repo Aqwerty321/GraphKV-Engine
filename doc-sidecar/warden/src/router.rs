@@ -11,8 +11,9 @@ use crate::{
     egress::{send_enriched_chunk, DEFAULT_GRAPHKV_DOC_WS_URL},
     embedder::{build_http_client, embed_text_chunks, EmbeddingConfig},
     models::{
-        parse_reasoning_completed, EnrichedChunk, RawChunk, ReasoningRequest, DEFAULT_NATS_URL,
-        REASONING_COMPLETED_SUBJECT, REASONING_REQUESTS_SUBJECT,
+        parse_reasoning_completed, parse_sandbox_log_envelope, EnrichedChunk, RawChunk,
+        ReasoningRequest, DEFAULT_NATS_URL, REASONING_COMPLETED_SUBJECT,
+        REASONING_REQUESTS_SUBJECT, SANDBOX_LOG_SUBJECT,
     },
 };
 
@@ -58,6 +59,10 @@ pub async fn run_router(
         .subscribe(REASONING_COMPLETED_SUBJECT.to_owned())
         .await
         .context("failed to subscribe to completed reasoning subject")?;
+    let mut sandbox_logs = nats
+        .subscribe(SANDBOX_LOG_SUBJECT.to_owned())
+        .await
+        .context("failed to subscribe to sandbox log ingest subject")?;
     let http_client = build_http_client(config.embedding.timeout)?;
     let mut incoming_open = true;
 
@@ -81,6 +86,10 @@ pub async fn run_router(
             maybe_message = completed.next() => {
                 let message = maybe_message.ok_or_else(|| anyhow!("NATS completed reasoning subscription closed"))?;
                 handle_completed_payload(config.websocket_url.as_ref(), message.payload.as_ref()).await?;
+            }
+            maybe_message = sandbox_logs.next() => {
+                let message = maybe_message.ok_or_else(|| anyhow!("NATS sandbox log subscription closed"))?;
+                handle_sandbox_log_payload(&nats, message.payload.as_ref()).await?;
             }
         }
     }
@@ -137,6 +146,13 @@ pub async fn handle_completed_payload(websocket_url: &str, payload: &[u8]) -> Re
     send_enriched_chunk(websocket_url, &completed.chunk).await
 }
 
+pub async fn handle_sandbox_log_payload(nats: &NatsClient, payload: &[u8]) -> Result<()> {
+    let envelope = parse_sandbox_log_envelope(payload)
+        .context("failed to deserialize sandbox log NATS payload")?
+        .into_owned();
+    publish_reasoning_request(nats, envelope.into_raw_chunk()).await
+}
+
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
@@ -168,6 +184,14 @@ mod tests {
     fn documentation_routes_to_reasoner() {
         assert_eq!(
             route_target(&raw(ChunkKind::Documentation)),
+            RouteTarget::Reasoner
+        );
+    }
+
+    #[test]
+    fn execution_logs_route_to_reasoner() {
+        assert_eq!(
+            route_target(&raw(ChunkKind::ExecutionLog)),
             RouteTarget::Reasoner
         );
     }

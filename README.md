@@ -1,10 +1,68 @@
-# GraphKV-Engine SCIP Ingestion Server
+# GraphKV-Engine
 
-Headless C++26 WebSocket ingestion server for binary SCIP indexes and normalized long-document bundles. The current ingress boundary receives Zstd-compressed SCIP protobuf payloads at `/v1/ingest_scip`, Zstd-compressed document NDJSON at `/v1/ingest_docs`, also exposes `/v1/ingest` for the GraphKV-Engine route, converts admitted binary SCIP into an immutable GraphKV CSR snapshot, and publishes that snapshot for read-side consumers.
+GraphKV-Engine is a local repository understanding and evidence synthesis runtime. It started as a headless C++26 WebSocket ingestion server for SCIP indexes and long-document bundles, and now also powers the Binary Star MCP path used by OpenCode for compact context retrieval, proof-carrying edits, and sandbox-derived execution evidence.
+
+At the storage boundary, the current ingress path receives Zstd-compressed SCIP protobuf payloads at `/v1/ingest_scip`, Zstd-compressed document NDJSON at `/v1/ingest_docs`, and `/v1/ingest` for the GraphKV route, converts admitted binary SCIP into an immutable GraphKV CSR snapshot, and publishes that snapshot for read-side consumers.
 
 The production ingest path uses a custom protobuf wire scanner for the SCIP fields needed by GraphKV. Generated SCIP protobuf is still built for compatibility, tests, and schema validation, but durable GraphKV snapshots own their string bytes in a contiguous `StringTape`. The network callback now admits and classifies frames through a transport-free ingress gate, parses small JSON control frames with Glaze, and hands binary SCIP work to a bounded worker dispatcher instead of spawning detached per-message threads.
 
 GraphKV-Engine is also the local context synthesizer for OpenCode. The resident arena is treated as the large context store, while the network boundary emits OpenCode `POST /session/{id}/message` JSON bodies containing dense synthesized context instead of raw repository sprawl. Document synthesis uses a resident retrieval index: dense ANN delegates to Unum USearch, sparse BM25-style postings stay native in GraphKV metadata, and C++ Reciprocal Rank Fusion intersects the results with SCIP/doc-code graph evidence.
+
+## Current Runtime Surface
+
+- Compact repo context synthesis from SCIP, docs, and graph-connected retrieval evidence.
+- Proof-carrying source coordinates with `evidence_id` and `range_sha256` for deterministic edits.
+- `edit_source_code` span verification and proof records for stale-range rejection.
+- Snapshot-backed `execute_sandbox` validation with execution tiers, `patch_id`, and structured evidence.
+- Local failure memory under `.graphkv/failure_memory.jsonl` for repeated sandbox signatures.
+- Rust Warden ingestion of sandbox logs as retrieval chunks instead of raw log archives.
+
+## Why It Exists
+
+The point is not to dump more repository text into the model. The point is to give an agent a smaller, better context surface and a tighter edit/validation loop:
+
+1. rank or retrieve the most relevant target
+2. return bounded, proof-carrying evidence
+3. edit against verified coordinates
+4. validate inside an isolated sandbox snapshot
+5. feed execution evidence back into later retrieval and ranking
+
+That keeps repo work grounded in executable evidence instead of broad file browsing.
+
+## Benchmarks
+
+The current OpenCode Binary Star benchmark suite includes a built-in complex 5-repo run over FastAPI, HTTPX, Pydantic, ripgrep, and Redis. The suite exercises three scenarios per repo:
+
+- `survey`: compact architecture understanding with `query_context` and one directory lens.
+- `proof_edit`: proof-carrying edit followed by sandbox validation.
+- `failure_recovery`: fail in the sandbox first, then repair using execution evidence.
+
+Latest complex-suite result from `benchmarks/results/field-trials/latest_complex_suite.json`:
+
+- 5/5 repositories passed behavior and protocol gates.
+- 15 OpenCode turns total.
+- 20 sandbox executions requested by the agent.
+- 0 native tool violations.
+- 9,863,899 raw tracked-text tokens reduced to 17,678 MCP context tokens.
+- Weighted raw-to-MCP reduction: 557.98x.
+
+Run it with:
+
+```sh
+python3 benchmarks/opencode_repo_trials.py \
+  --suite complex \
+  --scenarios survey,proof_edit,failure_recovery \
+  --timeout-seconds 420 \
+  --output benchmarks/results/field-trials/latest_complex_suite.json
+```
+
+The benchmark write-up is in `benchmarks/FIELD_TRIAL_RESULTS.md` and records both strengths and remaining weak spots such as repeated validation sandboxes and incomplete OpenCode event echo for later sandbox calls.
+
+## Key Docs
+
+- `docs/EXECUTION_MEMORY_ARCHITECTURE.md`: sandbox execution as retrieval evidence, snapshot policy, Warden ingestion, and backend abstraction.
+- `benchmarks/FIELD_TRIAL_RESULTS.md`: strict e2e and complex-suite benchmark results, including failures and caveats.
+- `DESIGN.md`: broader system design notes for the GraphKV engine itself.
 
 ## Build
 

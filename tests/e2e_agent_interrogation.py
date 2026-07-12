@@ -32,14 +32,18 @@ ARCHITECTURE_QUERY = (
 WRITE_QUERY = (
     "Perform a disposable write-and-execute smoke test in tests/fixtures/agent_mutation_target.py. "
     "Use only graphkv-binary-star MCP tools. First call query_context for the target file and main_initialization. "
-    "Then call search_source for main_initialization and read_source_slice around the returned line numbers. "
-    "Then use edit_source_code to add a small Python logging statement inside main_initialization without changing its return value. "
+    "Then call search_source for main_initialization and trust the returned path, line, and numbered_text as authoritative coordinates. "
+    "Immediately call edit_source_code to add exactly this first body statement inside main_initialization without changing its return value: "
+    "_graphkv_zero_hesitation_marker = 'source-search-direct-edit'. "
+    "Pass the selected evidence_id as evidence_id and range_sha256 as expected_range_sha256 to edit_source_code. "
+    "Do not call read_directory_lens, read_source_slice, or execute_sandbox before edit_source_code. "
     "Finally call execute_sandbox with exactly: python3 -m py_compile tests/fixtures/agent_mutation_target.py. "
     "Finish with the marker WRITE_EXECUTE_COMPLETE."
 )
 
 CUSTOM_TOOLS = {
     "query_context",
+    "rank_intent_targets",
     "read_directory_lens",
     "search_source",
     "read_source_slice",
@@ -74,6 +78,9 @@ RAW_DUMP_PATTERNS = [
     re.compile(r"(?i)show me the whole file"),
     re.compile(r"(?i)raw dump"),
 ]
+COORDINATE_TOOLS = {"search_source", "read_source_slice"}
+PROOF_MARKERS = ("evidence_id", "range_sha256", "before_range_sha256", "edit_proof_id")
+EXECUTION_EVIDENCE_MARKERS = ("execution_id", "snapshot_id", "evidence", "failure_memory")
 
 
 @dataclass
@@ -176,22 +183,98 @@ def parse_json_events(text: str) -> list[Any]:
     return events
 
 
-def walk_json(value: Any) -> list[Any]:
-    values = [value]
+def iter_json_nodes(value: Any):
+    yield value
     if isinstance(value, dict):
         for child in value.values():
-            values.extend(walk_json(child))
+            yield from iter_json_nodes(child)
     elif isinstance(value, list):
         for child in value:
-            values.extend(walk_json(child))
-    return values
+            yield from iter_json_nodes(child)
+
+
+def compact_consecutive_tools(tool_names: list[str]) -> list[str]:
+    compacted: list[str] = []
+    for tool_name in tool_names:
+        if not compacted or compacted[-1] != tool_name:
+            compacted.append(tool_name)
+    return compacted
+
+
+def raw_tool_mentions(raw: str) -> list[str]:
+    mentions: list[tuple[int, str]] = []
+    for tool_name in CUSTOM_TOOLS:
+        pattern = re.compile(rf"graphkv-binary-star_{re.escape(tool_name)}")
+        mentions.extend((match.start(), tool_name) for match in pattern.finditer(raw))
+    for tool_name in NATIVE_TOOL_NAMES:
+        pattern = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(tool_name)}(?![A-Za-z0-9_])")
+        mentions.extend((match.start(), tool_name) for match in pattern.finditer(raw))
+    return [tool_name for _position, tool_name in sorted(mentions)]
+
+
+def find_hesitation_violation(tool_names: list[str], *, require_direct_edit: bool = False) -> str | None:
+    if tool_names.count("rank_intent_targets") > 1:
+        return "HESITATION VIOLATION: rank_intent_targets occurred more than once"
+    compacted = compact_consecutive_tools(tool_names)
+    for position, tool_name in enumerate(compacted):
+        if tool_name == "rank_intent_targets" and "read_directory_lens" in compacted[position + 1 :]:
+            return "HESITATION VIOLATION: read_directory_lens occurred after intent ranking"
+    for position, tool_name in enumerate(compacted):
+        if tool_name not in COORDINATE_TOOLS:
+            continue
+        following = compacted[position + 1] if position + 1 < len(compacted) else None
+        if require_direct_edit and following != "edit_source_code":
+            return (
+                "HESITATION VIOLATION: expected edit_source_code immediately after "
+                f"{tool_name}, saw {following or 'end-of-turn'}"
+            )
+        for later_tool in compacted[position + 1 :]:
+            if later_tool == "read_directory_lens":
+                return "HESITATION VIOLATION: read_directory_lens occurred after source coordinates"
+    return None
+
+
+def assert_no_hesitation_violation(turn: TurnResult, *, require_direct_edit: bool = False) -> None:
+    violation = find_hesitation_violation(turn.tool_names, require_direct_edit=require_direct_edit)
+    if violation is not None:
+        raise AssertionError(f"{violation}; tools={turn.tool_names}")
+
+
+def assert_direct_edit_pipeline(turn: TurnResult) -> None:
+    compacted = compact_consecutive_tools(turn.tool_names)
+    if "read_source_slice" in compacted:
+        raise AssertionError(f"HESITATION VIOLATION: read_source_slice used in direct search edit pipeline; tools={turn.tool_names}")
+    if "read_directory_lens" in compacted:
+        raise AssertionError(f"HESITATION VIOLATION: read_directory_lens used during edit pipeline; tools={turn.tool_names}")
+    required_order = ["query_context", "search_source", "edit_source_code", "execute_sandbox"]
+    positions: dict[str, int] = {}
+    for tool_name in required_order:
+        if tool_name not in compacted:
+            raise AssertionError(f"expected deterministic edit pipeline tool {tool_name!r}; saw tools={turn.tool_names}")
+        positions[tool_name] = compacted.index(tool_name)
+    if not all(positions[left] < positions[right] for left, right in zip(required_order, required_order[1:])):
+        raise AssertionError(f"deterministic edit pipeline order was violated; tools={turn.tool_names}")
+    if compacted[positions["search_source"] + 1] != "edit_source_code":
+        raise AssertionError(f"HESITATION VIOLATION: edit_source_code did not immediately follow search_source; tools={turn.tool_names}")
+
+
+def assert_proof_metadata(turn: TurnResult) -> None:
+    missing = [marker for marker in PROOF_MARKERS if marker not in turn.combined]
+    if missing:
+        raise AssertionError(f"proof-carrying edit metadata missing from write turn logs: {missing}")
+
+
+def assert_execution_evidence(turn: TurnResult) -> None:
+    missing = [marker for marker in EXECUTION_EVIDENCE_MARKERS if marker not in turn.combined]
+    if missing:
+        raise AssertionError(f"execution-derived evidence missing from sandbox turn logs: {missing}")
 
 
 def extract_tool_names(events: list[Any], raw: str) -> list[str]:
     names: list[str] = []
     known = CUSTOM_TOOLS | NATIVE_TOOL_NAMES
     for event in events:
-        for node in walk_json(event):
+        for node in iter_json_nodes(event):
             if not isinstance(node, dict):
                 continue
             for key in ("tool", "toolName", "tool_name", "name"):
@@ -207,16 +290,13 @@ def extract_tool_names(events: list[Any], raw: str) -> list[str]:
                     names.append(value)
     if names:
         return names
-    for tool in known:
-        pattern = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(tool)}(?![A-Za-z0-9_])")
-        names.extend([tool] * len(pattern.findall(raw)))
-    return names
+    return raw_tool_mentions(raw)
 
 
 def extract_session_id(events: list[Any]) -> str | None:
     candidate_keys = {"sessionID", "sessionId", "session_id"}
     for event in events:
-        for node in walk_json(event):
+        for node in iter_json_nodes(event):
             if isinstance(node, dict):
                 for key in candidate_keys:
                     value = node.get(key)
@@ -236,13 +316,29 @@ def estimate_tokens(text: str) -> int:
 
 def extract_context_payload_tokens(events: list[Any], raw: str) -> int:
     payloads: list[str] = []
-    graphkv_markers = ("role: high-speed-context-synthesizer", "doc_retrieval_backend", "top_doc_chunks", "GraphKV")
     for event in events:
-        for node in walk_json(event):
-            if isinstance(node, str) and any(marker in node for marker in graphkv_markers):
-                payloads.append(node)
-    if not payloads:
-        payloads = [line for line in raw.splitlines() if any(marker in line for marker in graphkv_markers)]
+        for node in iter_json_nodes(event):
+            if not isinstance(node, dict):
+                continue
+            tool_name = node.get("tool")
+            if tool_name not in {"query_context", "graphkv-binary-star_query_context"}:
+                continue
+            state = node.get("state")
+            if not isinstance(state, dict):
+                continue
+            output = state.get("output")
+            if not isinstance(output, str) or not output:
+                continue
+            context_text = output
+            try:
+                parsed_output = json.loads(output)
+            except json.JSONDecodeError:
+                parsed_output = None
+            if isinstance(parsed_output, dict):
+                parsed_context = parsed_output.get("context")
+                if isinstance(parsed_context, str) and parsed_context:
+                    context_text = parsed_context
+            payloads.append(context_text)
     return sum(estimate_tokens(payload) for payload in payloads)
 
 
@@ -366,8 +462,8 @@ def verify_opencode_lockdown() -> None:
 
 def verify_mutation(root: Path, fixture: Path) -> None:
     text = fixture.read_text(encoding="utf-8")
-    if "logging.info" not in text:
-        raise AssertionError("write/execute turn did not inject a logging.info statement into the disposable fixture")
+    if "_graphkv_zero_hesitation_marker" not in text:
+        raise AssertionError("write/execute turn did not inject the deterministic zero-hesitation marker into the disposable fixture")
     compile_result = subprocess.run(
         [sys.executable, "-m", "py_compile", str(fixture)],
         cwd=root,
@@ -405,6 +501,7 @@ def main() -> int:
             raise AssertionError(f"handshake turn failed with {handshake.command.returncode}\n{handshake.combined}")
         assert_contains_tool(handshake, "read_directory_lens")
         assert_no_native_fallback(handshake)
+        assert_no_hesitation_violation(handshake)
 
         session_id = handshake.session_id
         ping_pong = run_opencode_turn(root, ARCHITECTURE_QUERY, args.timeout_seconds, session_id, session_id is None, title)
@@ -416,6 +513,7 @@ def main() -> int:
         if "target_node" not in ping_pong.combined:
             raise AssertionError("deep drill did not include a specific target_node argument in tool-call logs")
         assert_no_native_fallback(ping_pong)
+        assert_no_hesitation_violation(ping_pong)
 
         context_tokens = ping_pong.context_payload_tokens or estimate_tokens(ping_pong.combined)
         if context_tokens > args.max_context_tokens:
@@ -428,9 +526,13 @@ def main() -> int:
             write_turn = run_opencode_turn(root, WRITE_QUERY, args.timeout_seconds, session_id, session_id is None, title)
             if write_turn.command.returncode != 0:
                 raise AssertionError(f"write/execute turn failed with {write_turn.command.returncode}\n{write_turn.combined}")
-            for expected_tool in ("query_context", "search_source", "read_source_slice", "edit_source_code", "execute_sandbox"):
+            for expected_tool in ("query_context", "search_source", "edit_source_code", "execute_sandbox"):
                 assert_contains_tool(write_turn, expected_tool)
             assert_no_native_fallback(write_turn, allow_execute_sandbox=True)
+            assert_no_hesitation_violation(write_turn, require_direct_edit=True)
+            assert_direct_edit_pipeline(write_turn)
+            assert_proof_metadata(write_turn)
+            assert_execution_evidence(write_turn)
             verify_mutation(root, fixture)
 
         report = {
@@ -439,6 +541,9 @@ def main() -> int:
             "handshake_tools": handshake.tool_names,
             "ping_pong_tools": ping_pong.tool_names,
             "write_tools": write_turn.tool_names if write_turn else [],
+            "write_proof_markers": {marker: bool(write_turn and marker in write_turn.combined) for marker in PROOF_MARKERS},
+            "write_execution_markers": {marker: bool(write_turn and marker in write_turn.combined) for marker in EXECUTION_EVIDENCE_MARKERS},
+            "deterministic_edit_pipeline": ["query_context", "search_source", "edit_source_code", "execute_sandbox"],
             "context_payload_tokens": context_tokens,
             "context_bounds": {"min": args.min_context_tokens, "max": args.max_context_tokens},
         }

@@ -8,6 +8,7 @@ pub const NATS_SCHEMA_VERSION: u16 = 1;
 pub const DEFAULT_NATS_URL: &str = "nats://127.0.0.1:4222";
 pub const REASONING_REQUESTS_SUBJECT: &str = "graphkv.reasoning.requests";
 pub const REASONING_COMPLETED_SUBJECT: &str = "graphkv.reasoning.completed";
+pub const SANDBOX_LOG_SUBJECT: &str = "graphkv.sandbox.logs.ingest.requests";
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -15,6 +16,7 @@ pub enum ChunkKind {
     SourceCode,
     #[default]
     Documentation,
+    ExecutionLog,
     Other,
 }
 
@@ -168,6 +170,155 @@ pub fn parse_reasoning_completed(input: &[u8]) -> serde_json::Result<ReasoningCo
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct SandboxTextStream<'a> {
+    #[serde(default)]
+    pub line_count: u64,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(borrow, default)]
+    pub text: Cow<'a, str>,
+}
+
+impl<'a> SandboxTextStream<'a> {
+    pub fn into_owned(self) -> SandboxTextStream<'static> {
+        SandboxTextStream {
+            line_count: self.line_count,
+            truncated: self.truncated,
+            text: Cow::Owned(self.text.into_owned()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct SandboxEvidence<'a> {
+    #[serde(borrow, default)]
+    pub files: Vec<Cow<'a, str>>,
+    #[serde(borrow, default)]
+    pub symbols: Vec<Cow<'a, str>>,
+    #[serde(borrow, default)]
+    pub error_excerpt: Cow<'a, str>,
+    #[serde(borrow, default)]
+    pub failure_signature: Option<Cow<'a, str>>,
+}
+
+impl<'a> SandboxEvidence<'a> {
+    pub fn into_owned(self) -> SandboxEvidence<'static> {
+        SandboxEvidence {
+            files: self.files.into_iter().map(|item| Cow::Owned(item.into_owned())).collect(),
+            symbols: self.symbols.into_iter().map(|item| Cow::Owned(item.into_owned())).collect(),
+            error_excerpt: Cow::Owned(self.error_excerpt.into_owned()),
+            failure_signature: self.failure_signature.map(|item| Cow::Owned(item.into_owned())),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SandboxExecutionResult<'a> {
+    #[serde(borrow, default)]
+    pub execution_id: Cow<'a, str>,
+    #[serde(borrow, default)]
+    pub snapshot_id: Cow<'a, str>,
+    #[serde(borrow, default)]
+    pub patch_id: Option<Cow<'a, str>>,
+    #[serde(borrow, default)]
+    pub execution_tier: Cow<'a, str>,
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub timed_out: bool,
+    #[serde(default)]
+    pub duration_ms: u64,
+    #[serde(borrow, default)]
+    pub stdout: Option<SandboxTextStream<'a>>,
+    #[serde(borrow, default)]
+    pub stderr: Option<SandboxTextStream<'a>>,
+    #[serde(borrow, default)]
+    pub evidence: SandboxEvidence<'a>,
+}
+
+impl<'a> SandboxExecutionResult<'a> {
+    pub fn into_owned(self) -> SandboxExecutionResult<'static> {
+        SandboxExecutionResult {
+            execution_id: Cow::Owned(self.execution_id.into_owned()),
+            snapshot_id: Cow::Owned(self.snapshot_id.into_owned()),
+            patch_id: self.patch_id.map(|item| Cow::Owned(item.into_owned())),
+            execution_tier: Cow::Owned(self.execution_tier.into_owned()),
+            exit_code: self.exit_code,
+            timed_out: self.timed_out,
+            duration_ms: self.duration_ms,
+            stdout: self.stdout.map(SandboxTextStream::into_owned),
+            stderr: self.stderr.map(SandboxTextStream::into_owned),
+            evidence: self.evidence.into_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SandboxLogEnvelope<'a> {
+    pub schema_version: u16,
+    #[serde(borrow)]
+    pub request_id: Cow<'a, str>,
+    #[serde(borrow)]
+    pub command: Cow<'a, str>,
+    #[serde(borrow)]
+    pub result: SandboxExecutionResult<'a>,
+}
+
+impl<'a> SandboxLogEnvelope<'a> {
+    pub fn into_owned(self) -> SandboxLogEnvelope<'static> {
+        SandboxLogEnvelope {
+            schema_version: self.schema_version,
+            request_id: Cow::Owned(self.request_id.into_owned()),
+            command: Cow::Owned(self.command.into_owned()),
+            result: self.result.into_owned(),
+        }
+    }
+
+    pub fn into_raw_chunk(self) -> RawChunk<'static> {
+        let result = self.result;
+        let execution_id = if result.execution_id.is_empty() {
+            self.request_id.into_owned()
+        } else {
+            result.execution_id.into_owned()
+        };
+        let stderr = result.stderr.as_ref().map(|stream| stream.text.as_ref()).unwrap_or("");
+        let stdout = result.stdout.as_ref().map(|stream| stream.text.as_ref()).unwrap_or("");
+        let files = result.evidence.files.iter().map(Cow::as_ref).collect::<Vec<_>>().join(", ");
+        let symbols = result.evidence.symbols.iter().map(Cow::as_ref).collect::<Vec<_>>().join(", ");
+        let command = self.command.into_owned();
+        let snapshot_id = result.snapshot_id.as_ref();
+        let patch_id = result.patch_id.as_ref().map(Cow::as_ref).unwrap_or("");
+        let tier = result.execution_tier.as_ref();
+        let exit_code = result.exit_code;
+        let timed_out = result.timed_out;
+        let duration_ms = result.duration_ms;
+        let excerpt = result.evidence.error_excerpt.as_ref();
+        let failure_signature = result
+            .evidence
+            .failure_signature
+            .as_ref()
+            .map(Cow::as_ref)
+            .unwrap_or("");
+        let text = format!(
+            "# GraphKV Execution Session\nexecution_id: {execution_id}\nsnapshot_id: {snapshot_id}\npatch_id: {patch_id}\ntier: {tier}\nexit_code: {exit_code:?}\ntimed_out: {timed_out}\nduration_ms: {duration_ms}\nfailure_signature: {failure_signature}\nfiles: {files}\nsymbols: {symbols}\n\n## Error Excerpt\n{excerpt}\n\n## stderr\n{stderr}\n\n## stdout\n{stdout}",
+        );
+        RawChunk {
+            chunk_id: Cow::Owned(format!("{execution_id}:logs")),
+            document_id: Cow::Owned(execution_id.clone()),
+            path: Cow::Owned(format!("execution/{execution_id}.log")),
+            heading: Cow::Owned(format!("{} exit={exit_code:?}", command)),
+            language: Cow::Borrowed("log"),
+            chunk_type: ChunkKind::ExecutionLog,
+            text: Cow::Owned(text),
+        }
+    }
+}
+
+pub fn parse_sandbox_log_envelope(input: &[u8]) -> serde_json::Result<SandboxLogEnvelope<'_>> {
+    serde_json::from_slice(input)
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct DoclingChunk<'a> {
     #[serde(borrow, alias = "id")]
     pub chunk_id: Cow<'a, str>,
@@ -302,6 +453,19 @@ mod tests {
         assert!(matches!(chunk.path, Cow::Borrowed("README.md")));
         assert!(matches!(chunk.text, Cow::Borrowed("borrow me")));
         assert!(!chunk.is_source_code());
+        Ok(())
+    }
+
+    #[test]
+    fn sandbox_log_becomes_execution_chunk() -> anyhow::Result<()> {
+        let input = br#"{"schema_version":1,"kind":"sandbox_execution_logs","request_id":"sandbox-1","command":"python -m py_compile app.py","result":{"execution_id":"exec-1","snapshot_id":"snapshot-1","execution_tier":"tier_1_validation","exit_code":1,"timed_out":false,"duration_ms":17,"stdout":{"line_count":0,"truncated":false,"text":""},"stderr":{"line_count":1,"truncated":false,"text":"app.py:3: error: nope"},"evidence":{"files":["app.py"],"symbols":["main"],"error_excerpt":"app.py:3: error: nope","failure_signature":"abc123"}}}"#;
+        let envelope = parse_sandbox_log_envelope(input)?.into_owned();
+        let chunk = envelope.into_raw_chunk();
+
+        assert_eq!(chunk.chunk_type, ChunkKind::ExecutionLog);
+        assert_eq!(chunk.path, "execution/exec-1.log");
+        assert!(chunk.text.contains("failure_signature: abc123"));
+        assert!(chunk.text.contains("files: app.py"));
         Ok(())
     }
 

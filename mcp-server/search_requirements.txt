@@ -1,0 +1,3 @@
+# Install or run with uv:
+#   uv run --with-requirements mcp-server/search_requirements.txt python mcp-server/search_server.py
+mcp

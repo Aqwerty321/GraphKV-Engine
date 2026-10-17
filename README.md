@@ -1,52 +1,158 @@
 # GraphKV-Engine
 
-GraphKV-Engine is a local repository understanding and evidence synthesis runtime. It started as a headless C++26 WebSocket ingestion server for SCIP indexes and long-document bundles, and now also powers the Binary Star MCP path used by OpenCode for compact context retrieval, proof-carrying edits, and sandbox-derived execution evidence.
+GraphKV-Engine is a local runtime that helps coding agents understand a repository without reading all of it. A C++26 WebSocket server ingests SCIP code indexes and long-document bundles into an immutable in-memory graph, then synthesizes small, evidence-backed context packets for the agent. A Python MCP server (the "Binary Star" profile for OpenCode) sits on top and gives the agent a tight loop: rank a target, edit it against verified coordinates, validate the change in a sandbox, and feed the result back into later retrieval.
 
-At the storage boundary, the current ingress path receives Zstd-compressed SCIP protobuf payloads at `/v1/ingest_scip`, Zstd-compressed document NDJSON at `/v1/ingest_docs`, and `/v1/ingest` for the GraphKV route, converts admitted binary SCIP into an immutable GraphKV CSR snapshot, and publishes that snapshot for read-side consumers.
+The goal is not to dump more repository text into the model. It is to give the agent a smaller, better context surface and grounded, executable evidence instead of broad file browsing.
 
-The production ingest path uses a custom protobuf wire scanner for the SCIP fields needed by GraphKV. Generated SCIP protobuf is still built for compatibility, tests, and schema validation, but durable GraphKV snapshots own their string bytes in a contiguous `StringTape`. The network callback now admits and classifies frames through a transport-free ingress gate, parses small JSON control frames with Glaze, and hands binary SCIP work to a bounded worker dispatcher instead of spawning detached per-message threads.
+## Highlights
 
-GraphKV-Engine is also the local context synthesizer for OpenCode. The resident arena is treated as the large context store, while the network boundary emits OpenCode `POST /session/{id}/message` JSON bodies containing dense synthesized context instead of raw repository sprawl. Document synthesis uses a resident retrieval index: dense ANN delegates to Unum USearch, sparse BM25-style postings stay native in GraphKV metadata, and C++ Reciprocal Rank Fusion intersects the results with SCIP/doc-code graph evidence.
+- **SCIP ingestion over WebSocket.** Zstd-compressed SCIP protobuf is parsed by a custom wire scanner and published as an immutable CSR graph snapshot.
+- **Document plane.** Zstd-compressed NDJSON doc bundles are indexed with dense ANN (Unum USearch), native BM25-style sparse postings, and Reciprocal Rank Fusion, with chunks linked to the code graph promoted as graph-connected evidence.
+- **OpenCode-native output.** Synthesized context is emitted as an OpenCode `POST /session/{id}/message` body, optionally with a JSON-schema output contract.
+- **Proof-carrying edits.** Source coordinates carry `evidence_id` and `range_sha256`, and `edit_source_code` rejects stale spans and returns a before/after proof record.
+- **Sandboxed validation as evidence.** `execute_sandbox` runs commands in a Docker workspace snapshot with execution tiers, and failures are recorded in `.graphkv/failure_memory.jsonl` to steer later ranking.
+- **Vague-intent routing.** `rank_intent_targets` turns prompts like "fix auth" or a `file:line` stack trace into ranked edit targets using lexical, git-heat, failure-memory and structural signals.
+- **Rust Warden sidecar.** Turns documentation and sandbox logs into embedded retrieval chunks over NATS.
 
-## Current Runtime Surface
+## How it works
 
-- Compact repo context synthesis from SCIP, docs, and graph-connected retrieval evidence.
-- Proof-carrying source coordinates with `evidence_id` and `range_sha256` for deterministic edits.
-- `edit_source_code` span verification and proof records for stale-range rejection.
-- Snapshot-backed `execute_sandbox` validation with execution tiers, `patch_id`, and structured evidence.
-- Local failure memory under `.graphkv/failure_memory.jsonl` for repeated sandbox signatures.
-- Rust Warden ingestion of sandbox logs as retrieval chunks instead of raw log archives.
+```mermaid
+flowchart LR
+  scip["SCIP index (zstd)"] --> gate
+  docs["Doc bundle (zstd NDJSON)"] --> gate
+  gate["IngressGate + worker"] --> snap["Immutable GraphKV snapshot + DocRetrievalIndex"]
+  snap --> synth["OpenCode context synthesis"]
+  agent["OpenCode agent"] <--> mcp["Binary Star MCP server"]
+  mcp -- "query over /v1/ingest" --> synth
+  mcp --> sandbox["Docker sandbox"]
+  mcp -- "docs + sandbox logs" --> nats["NATS"]
+  nats --> warden["Rust Warden"]
+  warden -- "embedded chunks to /v1/ingest_docs" --> gate
+```
 
-## Why It Exists
+- **Transport:** Drogon WebSocket endpoints at `/v1/ingest_scip`, `/v1/ingest_docs` and `/v1/ingest` (default port `8888`).
+- **Boundary:** a transport-free `IngressGate` classifies frames, parses small JSON control frames with Glaze, and admits compressed binary SCIP by size. The worker reads `ZSTD_getFrameContentSize` before allocating and rejects frames with unknown size or above the 250 MiB limit. The Drogon message cap uses the same value.
+- **Dispatch:** binary work goes to a bounded worker dispatcher instead of detached per-message threads. Ingest metrics go through an SPSC `TelemetryRingBuffer`.
+- **Storage:** snapshots own their string bytes in a contiguous `StringTape` with compact `StringRef` handles. A single immutable root is published atomically, protected by Folly hazard pointers in production builds.
+- **Execution memory:** see [`docs/EXECUTION_MEMORY_ARCHITECTURE.md`](docs/EXECUTION_MEMORY_ARCHITECTURE.md) for sandbox tiers, snapshot policy and Warden ingestion.
 
-The point is not to dump more repository text into the model. The point is to give an agent a smaller, better context surface and a tighter edit/validation loop:
+## MCP servers
 
-1. rank or retrieve the most relevant target
-2. return bounded, proof-carrying evidence
-3. edit against verified coordinates
-4. validate inside an isolated sandbox snapshot
-5. feed execution evidence back into later retrieval and ranking
+| Server | File | Tools |
+| --- | --- | --- |
+| GraphKV Binary Star | `mcp-server/server.py` | `query_context`, `rank_intent_targets`, `read_directory_lens`, `search_source`, `read_source_slice`, `edit_source_code`, `execute_sandbox`, `ingest_web_documentation`, `inspect_git_state` |
+| GraphKV Local Search | `mcp-server/search_server.py` | `list_workspaces`, `workspace_index_status`, `graph_stats`, `god_nodes`, `get_node`, `get_neighbors`, `get_community`, `query_graph`, `shortest_path`, `search_symbols` |
 
-That keeps repo work grounded in executable evidence instead of broad file browsing.
+The Local Search server reads `graphkv-out/` artifacts produced by `tools/build_graphkv_artifacts.py`.
 
-## Benchmarks
+## Tech stack
 
-The current OpenCode Binary Star benchmark suite includes a built-in complex 5-repo run over FastAPI, HTTPX, Pydantic, ripgrep, and Redis. The suite exercises three scenarios per repo:
+- **Engine:** C++26, CMake + Ninja, Drogon, Glaze, Microsoft GSL, Kokkos mdspan, Zstd, Protobuf (compatibility mode), Unum USearch, Folly
+- **MCP layer:** Python, `mcp` (FastMCP), `docker`, `websockets`, `nats-py`, `httpx`
+- **Sidecar:** Rust (tokio, async-nats, tokio-tungstenite, reqwest, zstd)
+- **Container:** NVIDIA TensorRT-LLM devel/runtime images with clang-22
 
-- `survey`: compact architecture understanding with `query_context` and one directory lens.
-- `proof_edit`: proof-carrying edit followed by sandbox validation.
-- `failure_recovery`: fail in the sandbox first, then repair using execution evidence.
+## Getting started
 
-Latest complex-suite result from `benchmarks/results/field-trials/latest_complex_suite.json`:
+### Prerequisites
 
-- 5/5 repositories passed behavior and protocol gates.
-- 15 OpenCode turns total.
-- 20 sandbox executions requested by the agent.
-- 0 native tool violations.
-- 9,863,899 raw tracked-text tokens reduced to 17,678 MCP context tokens.
-- Weighted raw-to-MCP reduction: 557.98x.
+- CMake 3.25+, Ninja, and a compiler and standard library with C++26 and `<print>` support
+- Python 3 and [uv](https://github.com/astral-sh/uv) for the MCP servers and helper tools
+- Docker (for the container build and for `execute_sandbox`)
+- Optional: a NATS server and the Rust toolchain for the Warden sidecar
 
-Run it with:
+### Build and test the engine
+
+```sh
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target scip_ingest_server
+ctest --test-dir build --output-on-failure
+```
+
+If your standard library lacks `<print>`, build the core only:
+
+```sh
+cmake -S . -B build -G Ninja -DGRAPHKV_BUILD_SERVER=OFF -DGRAPHKV_REQUIRE_STD_PRINT=OFF
+```
+
+Useful CMake options: `GRAPHKV_ENABLE_USEARCH` (default `ON`), `GRAPHKV_REQUIRE_FOLLY` (default `OFF`, set `ON` for production snapshot reclamation), `GRAPHKV_MAX_INGEST_BYTES` (default `262144000`), `GRAPHKV_BUILD_FUZZERS` (default `OFF`). Legacy `GRAPHIFY_*` names are still accepted as aliases.
+
+### Run the server
+
+```sh
+./build/scip_ingest_server                      # listens on 8888
+GRAPHKV_PORT=8899 ./build/scip_ingest_server    # pick another port
+```
+
+Send a SCIP index or a document bundle (both helpers compress with Zstd before sending):
+
+```sh
+python3 tools/send_scip_ws.py benchmarks/data/index.scip --port 8888
+
+python3 tools/build_doc_bundle.py /path/to/repo \
+  --output benchmarks/data/local_repos/mixed_docs.ndjson --max-files 500
+python3 tools/send_docs_ws.py benchmarks/data/local_repos/mixed_docs.ndjson --port 8888
+```
+
+A successful SCIP ingest returns a response like:
+
+```json
+{"ok":true,"mode":"strict-wire-scanner","compressed_bytes":104,"uncompressed_bytes":91,"documents":1,"symbols":1,"relationships":1,"occurrences":1,"arena_bytes":189,"string_bytes":53}
+```
+
+### Docker
+
+```sh
+docker build -t graphkv-engine .
+docker run --rm -p 8888:8888 graphkv-engine
+```
+
+The image builds pinned Folly and FastFloat, configures with `-DGRAPHKV_REQUIRE_FOLLY=ON`, and ships `graphkv-warden` and `warden_profile` in `/opt/graphkv/bin`. `benchmarks/docker_e2e_profile.py` rebuilds the image, smoke tests both WebSocket routes and writes a JSON profile report.
+
+### MCP servers
+
+```sh
+uv run --with-requirements mcp-server/requirements.txt python mcp-server/server.py
+uv run --with-requirements mcp-server/search_requirements.txt python mcp-server/search_server.py
+python3 tools/build_graphkv_artifacts.py /path/to/repo   # writes graphkv-out/ for the search server
+```
+
+Configuration is by environment variable. Binary Star reads `GRAPHKV_WORKSPACE_ROOT`, `GRAPHKV_QUERY_WS_URL`, `GRAPHKV_NATS_URL`, `GRAPHKV_MCP_SANDBOX_IMAGE`, `GRAPHKV_MCP_SANDBOX_SNAPSHOT_MODE`, `GRAPHKV_MCP_TRANSPORT`, `GRAPHKV_MCP_LENS_DEPTH`, `GRAPHKV_MCP_LENS_MAX_ENTRIES`, plus optional auth settings (`GRAPHKV_MCP_REQUIRE_AUTH`, `GRAPHKV_MCP_ACCESS_TOKEN`, `GRAPHKV_MCP_AUTH_INTROSPECTION_URL`, `GRAPHKV_MCP_TRUSTED_TOKENS_FILE`). The search server reads `GRAPHKV_WORKSPACE_ROOT`, `GRAPHKV_WORKSPACE_ROOTS`, `GRAPHKV_WORKSPACE_REGISTRY` and `GRAPHKV_ARTIFACT_DIR_NAME`.
+
+To install the isolated OpenCode profile (it backs up your current config first):
+
+```sh
+mcp-server/opencode/use-profile.sh binary-star   # or: classic | status | restore <backup-dir>
+```
+
+The bundled profile JSON uses absolute paths from the author's machine, so edit the `mcp` command and `GRAPHKV_WORKSPACE_ROOT` before installing it.
+
+### Fuzzing
+
+```sh
+cmake -S . -B build-fuzz -G Ninja -DCMAKE_CXX_COMPILER=clang++ \
+  -DGRAPHKV_BUILD_FUZZERS=ON -DGRAPHKV_BUILD_SERVER=OFF -DGRAPHKV_ENABLE_PROTOBUF_COMPAT=OFF
+cmake --build build-fuzz --target ingest_boundary_fuzzer
+./build-fuzz/ingest_boundary_fuzzer -runs=10000 -max_len=65536
+```
+
+## Results
+
+### Agent field trial (complex suite, 2026-05-29)
+
+`benchmarks/opencode_repo_trials.py --suite complex` clones FastAPI, HTTPX, Pydantic, ripgrep and Redis and runs three scenarios per repo with native OpenCode tools blocked: `survey`, `proof_edit` and `failure_recovery`.
+
+| Repository | Raw tokens | MCP context tokens | Reduction |
+| --- | ---: | ---: | ---: |
+| fastapi | 3,750,144 | 4,036 | 929.17x |
+| httpx | 193,506 | 3,615 | 53.53x |
+| pydantic | 2,098,841 | 3,414 | 614.77x |
+| ripgrep | 525,352 | 3,118 | 168.49x |
+| redis | 3,296,056 | 3,495 | 943.08x |
+
+- 5/5 repositories passed both the protocol gate and the behavioral probe contracts.
+- 15 OpenCode turns, 20 agent-requested sandbox executions, 0 native tool violations.
+- 9,863,899 raw tracked-text tokens reduced to 17,678 MCP context tokens (weighted 557.98x).
 
 ```sh
 python3 benchmarks/opencode_repo_trials.py \
@@ -56,117 +162,34 @@ python3 benchmarks/opencode_repo_trials.py \
   --output benchmarks/results/field-trials/latest_complex_suite.json
 ```
 
-The benchmark write-up is in `benchmarks/FIELD_TRIAL_RESULTS.md` and records both strengths and remaining weak spots such as repeated validation sandboxes and incomplete OpenCode event echo for later sandbox calls.
+[`benchmarks/FIELD_TRIAL_RESULTS.md`](benchmarks/FIELD_TRIAL_RESULTS.md) has the full write-up, including earlier runs and known weak spots.
 
-## Key Docs
+### Ingest latency
 
-- `docs/EXECUTION_MEMORY_ARCHITECTURE.md`: sandbox execution as retrieval evidence, snapshot policy, Warden ingestion, and backend abstraction.
-- `benchmarks/FIELD_TRIAL_RESULTS.md`: strict e2e and complex-suite benchmark results, including failures and caveats.
-- `DESIGN.md`: broader system design notes for the GraphKV engine itself.
+On an Intel Core Ultra 9 275HX with clang 22, the strict wire scanner ingests the checked-in real corpora in a mean of 13.40 us (`python_send_scip_ws.scip`, 12,847 bytes) and 59.58 us (`python_repo.scip`, 80,334 bytes), and scales close to linearly up to a 100,000-document synthetic index. In the Docker end-to-end profile, OpenCode synthesis over a resident graph and docs averaged 10.91 ms over 60 runs. See [`benchmarks/BASELINE.md`](benchmarks/BASELINE.md) for methodology and full tables.
 
-## Build
+## Limitations
 
-```sh
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build --target scip_ingest_server
-ctest --test-dir build --output-on-failure
+- Probes in the field trial are portable Python files, so the suite measures navigation, edit targeting and sandbox evidence, not native-language edits inside each codebase.
+- OpenCode event logs sometimes omit later sandbox result objects, and failure recovery can still repeat validation sandboxes.
+- The engine still builds dense chunk vectors from local projections. Feeding in sidecar embeddings and adding a GPU-backed subgraph synthesizer are listed as next steps in [`DESIGN.md`](DESIGN.md).
+- Builds without Folly fall back to a bounded-retire scheme meant for local development only.
+
+## Project structure
+
+```
+include/, src/     C++ engine: ingress gate, SCIP and doc ingestors, retrieval index, OpenCode protocol
+tests/             C++ unit tests (ctest) and the Python agent e2e harness
+fuzz/              LibFuzzer target for the ingest boundary
+benchmarks/        latency benchmark, Docker profiler, agent field trials, checked-in SCIP corpora
+tools/             WebSocket senders, doc bundle builder, graphkv-out artifact builder
+mcp-server/        Binary Star and Local Search MCP servers, OpenCode profiles
+doc-sidecar/warden Rust Warden router/reasoner and profiling binary
+docs/              architecture and planning notes
 ```
 
-The default configuration requires `std::println` support because the server startup path uses `<print>`. For core-only local testing on a host standard library that does not provide `<print>`, configure with:
+## Further reading
 
-```sh
-cmake -S . -B build -G Ninja -DGRAPHKV_BUILD_SERVER=OFF -DGRAPHKV_REQUIRE_STD_PRINT=OFF
-```
-
-Legacy `GRAPHIFY_*` CMake options are still accepted as aliases during the naming migration, but new configuration should use `GRAPHKV_*`. The default binary ingest gate is `GRAPHKV_MAX_INGEST_BYTES=262144000`. `GRAPHKV_ENABLE_USEARCH=ON` pulls the pinned USearch release used for dense document retrieval.
-The Drogon WebSocket message cap is set from the same value at server startup, so the transport boundary and the scanner gate reject the same maximum payload size.
-Binary WebSocket frames are treated as Zstd-compressed SCIP. The worker reads `ZSTD_getFrameContentSize` before allocation and rejects frames whose decompressed size is unknown or above the strict `250 * 1024 * 1024` byte VRAM admission limit.
-
-## Document Plane
-
-Long documents are ingested through `/v1/ingest_docs` as Zstd-compressed NDJSON bundles. The helper below scans mixed-language repositories for Markdown-like docs and source comments, emits normalized doc/chunk/link events, and the sender compresses the bundle before opening the WebSocket route:
-
-```sh
-python3 tools/build_doc_bundle.py /path/to/repo-a /path/to/repo-b \
-  --output benchmarks/data/local_repos/mixed_docs.ndjson \
-  --max-files 500
-python3 tools/send_docs_ws.py benchmarks/data/local_repos/mixed_docs.ndjson --port 8888
-```
-
-Every accepted doc bundle publishes a `DocIndexSnapshot` and a `DocRetrievalIndex`. The retrieval index stores native sparse postings over chunk previews, builds dense chunk vectors for USearch, and uses native RRF to blend dense and sparse results. During synthesis, linked chunks that overlap the latest SCIP graph are promoted as graph-connected evidence.
-
-## Docker
-
-```sh
-docker build -t graphkv-engine .
-docker run --rm -p 8888:8888 graphkv-engine
-```
-
-The Dockerfile uses NVIDIA TensorRT-LLM devel/runtime images, clang-22, matching LLVM binutils, Ninja, CMake, Drogon, Protobuf, Kokkos mdspan, Microsoft GSL, and a pinned Folly build.
-
-Production builds should use real Folly for snapshot reclamation. The Docker builder clones pinned upstream `fast_float` and Folly sources, installs Folly into `/opt/folly`, and configures this project with `-DGRAPHKV_REQUIRE_FOLLY=ON`. Local development builds may omit Folly and use the bounded-retire fallback, but that path is not the production concurrency model.
-
-The runtime image includes the extra shared libraries Folly links transitively in this environment, including `libdwarf` and `libelf`. The full Docker path has been validated end to end with the built image and the WebSocket ingest route.
-The runtime image also includes the Rust Warden profiling binary at `/opt/graphkv/bin/warden_profile`, so Docker profiling covers both the C++ ingress boundary and the document-sidecar serialization/compression path.
-
-To smoke test the running container with an existing binary SCIP payload, use the helper; it compresses the file with Zstd before sending the WebSocket frame:
-
-```sh
-docker run --rm -p 8890:8888 graphkv-engine
-python3 tools/send_scip_ws.py /path/to/index.scip.bin --port 8890
-```
-
-To rebuild, smoke test both WebSocket routes, and save a Docker profile report with durable build logs:
-
-```sh
-python3 benchmarks/docker_e2e_profile.py \
-  --image graphkv-engine:e2e \
-  --build-log /tmp/graphkv-docker-build.log \
-  --json-output benchmarks/results/docker_e2e_latest.json \
-  --doc-fixture benchmarks/data/local_repos/mixed_docs.ndjson \
-  --warden-profile-records 256 \
-  --warden-profile-runs 20 \
-  --require-doc-retrieval-markers
-```
-
-For local real-world corpus testing, generate SCIP fixtures from dense Python repos and pass them explicitly to the profiler:
-
-```sh
-benchmarks/generate_local_repo_corpora.sh /home/Aaditya/browser-use /home/Aaditya/GLM-OCR /home/Aaditya/vllm
-python3 benchmarks/docker_e2e_profile.py \
-  --image graphkv-engine:e2e \
-  --build-log /tmp/graphkv-docker-build.log \
-  --json-output benchmarks/results/docker_e2e_local_repos.json \
-  --doc-fixture benchmarks/data/local_repos/mixed_docs.ndjson \
-  --warden-profile-records 256 \
-  --warden-profile-runs 20 \
-  --require-doc-retrieval-markers \
-  --fixture benchmarks/data/local_repos/GLM-OCR.scip \
-  --fixture benchmarks/data/local_repos/browser-use.scip \
-  --fixture benchmarks/data/local_repos/vllm.scip \
-  --network-fixture benchmarks/data/local_repos/GLM-OCR.scip \
-  --network-fixture benchmarks/data/local_repos/browser-use.scip \
-  --network-fixture benchmarks/data/local_repos/vllm.scip
-```
-
-The generated local corpus directory is intentionally ignored by Git because it can include large machine-specific indexes.
-
-The validated response shape is:
-
-```json
-{"ok":true,"mode":"strict-wire-scanner","compressed_bytes":104,"uncompressed_bytes":91,"documents":1,"symbols":1,"relationships":1,"occurrences":1,"arena_bytes":189,"string_bytes":53}
-```
-
-The server listens on port `8888` by default. For local smoke tests when that port is already occupied, set `GRAPHKV_PORT`, for example `GRAPHKV_PORT=8899 ./build/scip_ingest_server`. `GRAPHIFY_PORT` remains a temporary fallback while local scripts migrate.
-
-## Boundary Fuzzing
-
-```sh
-cmake -S . -B build-fuzz -G Ninja \
-  -DCMAKE_CXX_COMPILER=clang++ \
-  -DGRAPHKV_BUILD_FUZZERS=ON \
-  -DGRAPHKV_BUILD_SERVER=OFF \
-  -DGRAPHKV_ENABLE_PROTOBUF_COMPAT=OFF
-cmake --build build-fuzz --target ingest_boundary_fuzzer
-./build-fuzz/ingest_boundary_fuzzer -runs=10000 -max_len=65536
-```
+- [`DESIGN.md`](DESIGN.md): shipped architecture, plan vs. shipped decisions, and tech debt
+- [`docs/EXECUTION_MEMORY_ARCHITECTURE.md`](docs/EXECUTION_MEMORY_ARCHITECTURE.md): sandbox execution as retrieval evidence
+- [`docs/DOCUMENT_CONTENT_PLANE_PLAN.md`](docs/DOCUMENT_CONTENT_PLANE_PLAN.md) and [`docs/NETWORK_INGESTION_BOUNDARY_PLAN.md`](docs/NETWORK_INGESTION_BOUNDARY_PLAN.md): design plans

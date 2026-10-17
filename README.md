@@ -193,3 +193,7 @@ docs/              architecture and planning notes
 - [`DESIGN.md`](DESIGN.md): shipped architecture, plan vs. shipped decisions, and tech debt
 - [`docs/EXECUTION_MEMORY_ARCHITECTURE.md`](docs/EXECUTION_MEMORY_ARCHITECTURE.md): sandbox execution as retrieval evidence
 - [`docs/DOCUMENT_CONTENT_PLANE_PLAN.md`](docs/DOCUMENT_CONTENT_PLANE_PLAN.md) and [`docs/NETWORK_INGESTION_BOUNDARY_PLAN.md`](docs/NETWORK_INGESTION_BOUNDARY_PLAN.md): design plans
+
+## License
+
+MIT. See [LICENSE](LICENSE).
